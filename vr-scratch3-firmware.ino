@@ -8,6 +8,8 @@
 #include <Wire.h> 
 #include <LiquidCrystal_I2C.h>
 
+#include <Servo.h>
+
 // #define ENABLE_DEBUG
 
 #if defined(ENABLE_DEBUG) && defined(HAVE_HWSERIAL3)
@@ -88,19 +90,6 @@ enum MessageID : uint8_t {
     MSG_ID_SIZE,
 };
 
-enum PortType : uint8_t {
-    NON_TYPE = 0,
-    LED_TRAFFIC,
-    ULTRASONIC,
-    SERVO,
-    GAS,
-    PHOTORES,
-    TEMPURATURE,
-    IR_SENSOR,
-    VAR_RESISTOR,
-    BUTTON,
-};
-
 enum MotorPort : uint8_t {
     MOTOR_PORT_1 = 0,
     MOTOR_PORT_2,
@@ -140,7 +129,7 @@ public:
 #define CCW_POWER(x)   (255 - x)
 
     MotorPortHandler(const PortCfg &cfg)
-        : dir_io_(cfg.dir_pin), pwr_io_(cfg.pwr_pin), direction_(CW), power_(0) 
+        : dir_io_(cfg.dir_pin), pwr_io_(cfg.pwr_pin), direction_(CW), power_(0)
     { }
 
     void init(void) {
@@ -166,6 +155,87 @@ private:
     uint8_t pwr_io_;
     bool    direction_;
     uint8_t power_;
+};
+
+class vPortConfig {
+public:
+    enum PortType : uint8_t {
+        UNDEFINED = 0,
+        LED_TRAFFIC,
+        ULTRASONIC,
+        SERVO,
+        GAS,
+        PHOTORES,
+        TEMPURATURE,
+        IR_SENSOR,
+        VAR_RESISTOR,
+        BUTTON,
+        END_OF_INDEX,
+    };
+
+    struct Config {
+        uint8_t  pin1;
+        uint8_t  pin2;
+        uint8_t  pin5;
+        uint8_t  pin6;
+        
+    };
+
+    vPortConfig(const Config &cfg) : config_(cfg) { }
+
+    void init(void) {
+        pinMode(config_.pin1, OUTPUT);
+        pinMode(config_.pin2, OUTPUT);
+        pinMode(config_.pin5, OUTPUT);
+        pinMode(config_.pin6, OUTPUT);
+        digitalWrite(config_.pin1, HIGH);
+        digitalWrite(config_.pin2, HIGH);
+        digitalWrite(config_.pin5, HIGH);
+        digitalWrite(config_.pin6, HIGH);
+        type_ = UNDEFINED;
+    }
+
+    setPort(const PortType type) {
+        if (type == type_) return;
+        
+        // Must detach pin if previous type is servo
+        if (type_ == SERVO) {
+            for (int i=0;i < 3;++i) {
+                if (servo_[i].attached()) 
+                    servo_[i].detach();
+            }
+        }
+
+        type_ = type;
+        switch(type_)
+        {
+        case LED_TRAFFIC:
+            pinMode(config_.pin1, OUTPUT);
+            pinMode(config_.pin2, OUTPUT);
+            pinMode(config_.pin5, OUTPUT);
+            pinMode(config_.pin6, OUTPUT);
+            digitalWrite(config_.pin1, LOW);
+            digitalWrite(config_.pin2, LOW);
+            digitalWrite(config_.pin5, LOW);
+            digitalWrite(config_.pin6, LOW);
+            break;
+
+        case SERVO:
+            if (!servo_[0].attached()) servo_[0].attach(config_.pin2);
+            if (!servo_[1].attached()) servo_[1].attach(config_.pin5);
+            if (!servo_[2].attached()) servo_[2].attach(config_.pin6);
+            for (int i=0;i < 3;++i)
+                servo_[i].write(0);
+            break;
+        default:
+            break;
+        }
+    }
+
+    Config config_;
+    Servo servo_[3];
+private:
+    PortType type_;
 };
 
 
@@ -213,12 +283,10 @@ const MsgHandleCb cb_tbl[MSG_ID_SIZE] = {
 
 Adafruit_NeoPixel pixel(NUMPIXELS, RGB_PIN, NEO_GRB + NEO_KHZ800);
 
-unsigned char port_init_type = NON_TYPE;
-
 const MotorPortHandler::PortCfg portCfg[MPORT_NUMSIZE] =
 {
-    { .dir_pin = 8, .pwr_pin = 5 },
-    { .dir_pin = 7, .pwr_pin = 6 }
+    { .dir_pin = 8, .pwr_pin = 5 }, // OUT 1
+    { .dir_pin = 7, .pwr_pin = 6 }  // OUT 2
 };
 
 MotorPortHandler dcmotor[2] =
@@ -229,13 +297,27 @@ MotorPortHandler dcmotor[2] =
 
 LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
 
+vPortConfig portConfigs[2] = {
+    {vPortConfig::Config{15, 13, 11, 3}},
+    {vPortConfig::Config{14, 12, 10, 2}}
+};
+
 void setup() {
+    // RGB pixel init
     pixel.begin();
     pixel.setPixelColor(0, Adafruit_NeoPixel::Color(0,0,0));
     pixel.show();
 
+    // DC Motor init
     for (int i=0;i < MPORT_NUMSIZE; ++i) 
         dcmotor[i].init();
+
+    dcmotor[0].setPower(0);
+    dcmotor[1].setPower(0);
+
+    // I/O ports config
+    for (int i=0; i < 2; ++i)
+        portConfigs[i].init();
 
 #ifdef ENABLE_DEBUG
     DEBUG.begin(115200);
@@ -359,6 +441,12 @@ void replyMessage(const Msg& msg)
     INTERFACE.write(msg.tx_, msg.header_);
 }
 
+void debug_response(Msg& msg)
+{
+    INTERFACE.write((char*)&msg.header_, sizeof(uint16_t));
+    INTERFACE.write(msg.rx_, msg.header_);
+}
+
 int cmdPutLedRGb(Msg& msg)
 {
     auto &r = msg.rx_[1];
@@ -368,18 +456,30 @@ int cmdPutLedRGb(Msg& msg)
     pixel.setPixelColor(0, Adafruit_NeoPixel::Color(r,g,b));
     pixel.show();
 
-    INTERFACE.write((char*)&msg.header_, sizeof(uint16_t));
-    INTERFACE.write(msg.rx_, msg.header_);
+    debug_response(msg);
 
     return ERR_OK;
 }
 
 int cmdPutLedTraffic(Msg& msg)
 {
-    auto &port     = msg.rx_[1];
-    auto &l_green  = msg.rx_[2];
-    auto &l_yellow = msg.rx_[3];
-    auto &l_red    = msg.rx_[4];
+    auto &port   = msg.rx_[1];
+    auto &red    = msg.rx_[2];
+    auto &yellow = msg.rx_[3];
+    auto &green  = msg.rx_[4];
+
+    port %= 2;
+    red %= 2;
+    green %= 2;
+    yellow %= 2;
+
+    const auto& cfg = portConfigs[port].config_;
+    portConfigs[port].setPort(vPortConfig::PortType::LED_TRAFFIC);
+    digitalWrite(cfg.pin2, red);
+    digitalWrite(cfg.pin5, yellow);
+    digitalWrite(cfg.pin6, green);
+
+    debug_response(msg);
 
     return ERR_OK;
 }
@@ -411,7 +511,7 @@ int cmdPutDcMotor(Msg& msg)
 
     case 0x02: // Set full
         direction = (param_ptr[0] % 2) ? Orientation::CW : Orientation::CCW;
-        power = param_ptr[0];
+        power     = param_ptr[1];
         dcmotor[p].setDirection(direction);
         dcmotor[p].setPower(power);
         break;
@@ -429,6 +529,8 @@ int cmdPutDcMotor(Msg& msg)
         break;
     }
 
+    debug_response(msg);
+
     return ERR_OK;
 }
 
@@ -439,6 +541,26 @@ int cmdPutBuzzer(Msg& msg)
 
 int cmdPutServos(Msg& msg)
 {
+    auto &port = msg.rx_[1];
+    auto &s1   = msg.rx_[2];
+    auto &s2   = msg.rx_[3];
+    auto &s3   = msg.rx_[4];
+
+    port %= 2;
+    s1 = constrain(s1, 0, 180);
+    s2 = constrain(s1, 0, 180);
+    s3 = constrain(s1, 0, 180);
+
+    const auto& cfg = portConfigs[port].config_;
+    portConfigs[port].setPort(vPortConfig::PortType::SERVO);
+
+    portConfigs[port].servo_[0].write(s1);
+    portConfigs[port].servo_[1].write(s2);
+    portConfigs[port].servo_[2].write(s3);
+
+    delay(10);
+
+    debug_response(msg);
     return ERR_OK;
 }
 
